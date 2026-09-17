@@ -9,6 +9,12 @@
 //   4. "Preppy Flywheel: Email Opened → Webhook"       (event=opened)
 //   5. "Preppy Flywheel: Email Clicked → Webhook"      (event=clicked)
 //   6. "Preppy Flywheel: Meeting Booked → Webhook"     (event=meeting)
+//   7. "Preppy Flywheel: Email Sent → Webhook"         (event=sent)
+//
+// SCOPE GUARD: NUKO's Apollo workspace also runs CLIMB and Invigilator
+// outbound. This endpoint writes ONLY into StraighterLine's Attio, so any
+// event carrying a sequence id that is not a known Preppy sequence is
+// dropped before the Attio lookup (see config.PREPPY_SEQUENCE_IDS).
 //
 // Engagement threshold logic:
 // - Clicks flag immediately (Flagged for Review = true).
@@ -32,9 +38,48 @@ const {
   ENABLE_REDUNDANT_APOLLO_REMOVAL,
   ENGAGEMENT_OPEN_THRESHOLD,
   ENGAGEMENT_OPEN_WINDOW_DAYS,
+  PREPPY_SEQUENCE_IDS,
+  NON_PREPPY_SEQUENCE_IDS,
+  REQUIRE_KNOWN_PREPPY_SEQUENCE,
 } = require('../config');
 
-const VALID_EVENTS = new Set(['replied', 'opened', 'clicked', 'bounced', 'finished', 'meeting']);
+const VALID_EVENTS = new Set(['replied', 'opened', 'clicked', 'bounced', 'finished', 'meeting', 'sent']);
+
+const PREPPY_IDS     = new Set(Object.values(PREPPY_SEQUENCE_IDS));
+const NON_PREPPY_IDS = new Set(Object.values(NON_PREPPY_SEQUENCE_IDS));
+
+// Maps an Apollo sequence id to a name for the Attio "Assigned Sequence"
+// text field.
+const SEQUENCE_NAME_BY_ID = Object.fromEntries(
+  Object.entries(PREPPY_SEQUENCE_IDS).map(([name, id]) => [id, name])
+);
+
+/**
+ * Decide whether an event belongs to StraighterLine.
+ *
+ * - No sequence id in the payload: allow. The Apollo workflow that calls
+ *   this URL is itself scoped to a Preppy sequence, so the URL is the
+ *   scope. Logged so an unexpected source is still visible.
+ * - Known Preppy id: allow.
+ * - Known non-Preppy id (CLIMB, Invigilator): drop, quietly — this is
+ *   expected traffic if a workflow is ever mis-pointed.
+ * - Unknown id: drop and alert. A new Preppy sequence needs adding to
+ *   config.PREPPY_SEQUENCE_IDS; anything else is another client's data.
+ */
+function sequenceGate(sequenceId) {
+  if (!sequenceId) return { allow: true, reason: 'no_sequence_id_in_payload' };
+  if (PREPPY_IDS.has(sequenceId)) return { allow: true, reason: 'preppy' };
+  if (NON_PREPPY_IDS.has(sequenceId)) {
+    return { allow: false, reason: 'non_preppy_sequence', alert: false };
+  }
+  if (!REQUIRE_KNOWN_PREPPY_SEQUENCE) return { allow: true, reason: 'unknown_sequence_allowed_by_config' };
+  return { allow: false, reason: 'unknown_sequence', alert: true };
+}
+
+// Read a number attribute off an Attio record, defaulting to 0.
+function num(values, slug) {
+  return Number(values?.[slug]?.[0]?.value) || 0;
+}
 
 module.exports = async (req, res) => {
   res.setHeader('Content-Type', 'application/json; charset=utf-8');
@@ -72,6 +117,18 @@ async function dispatch(event, body) {
     throw new Error('apollo webhook payload missing both email and contact_id');
   }
 
+  // StraighterLine-only guard — runs BEFORE any Attio call.
+  const gate = sequenceGate(ctx.sequenceId);
+  if (!gate.allow) {
+    const detail = { event, sequenceId: ctx.sequenceId, reason: gate.reason };
+    if (gate.alert) {
+      await alert('Apollo webhook from an unrecognised sequence — dropped, nothing written to Attio', detail);
+    } else {
+      console.warn('[apollo-webhook] dropped non-Preppy sequence event', JSON.stringify(detail));
+    }
+    return { skipped: gate.reason, sequenceId: ctx.sequenceId };
+  }
+
   // Find the Attio person record. Prefer email lookup since Apollo Contact ID
   // is stored there but not always indexed.
   const attioPerson = ctx.email
@@ -84,23 +141,38 @@ async function dispatch(event, body) {
   const attioPersonId = attioPerson?.id?.record_id;
 
   switch (event) {
-    case 'replied':   return handleReplied(attioPersonId, ctx);
+    case 'replied':   return handleReplied(attioPersonId, ctx, attioPerson);
     case 'opened':    return handleOpened(attioPersonId, ctx, attioPerson);
-    case 'clicked':   return handleClicked(attioPersonId, ctx);
-    case 'bounced':   return handleBounced(attioPersonId, ctx);
-    case 'finished':  return handleFinished(attioPersonId, ctx);
-    case 'meeting':   return handleMeeting(attioPersonId, ctx);
+    case 'clicked':   return handleClicked(attioPersonId, ctx, attioPerson);
+    case 'bounced':   return handleBounced(attioPersonId, ctx, attioPerson);
+    case 'finished':  return handleFinished(attioPersonId, ctx, attioPerson);
+    case 'meeting':   return handleMeeting(attioPersonId, ctx, attioPerson);
+    case 'sent':      return handleSent(attioPersonId, ctx, attioPerson);
   }
+}
+
+/**
+ * Fields written on EVERY event so the Apollo contact id and the sequence
+ * name stay current on the Attio record regardless of which event fired.
+ */
+function commonAttrs(ctx) {
+  const attrs = {};
+  if (ctx.apolloContactId) attrs.apolloContactId = String(ctx.apolloContactId);
+  const seqName = ctx.sequenceId && SEQUENCE_NAME_BY_ID[ctx.sequenceId];
+  if (seqName) attrs.assignedSequence = seqName;
+  return attrs;
 }
 
 // --------------------------------------------------------------------
 // Per-event handlers
 // --------------------------------------------------------------------
 
-async function handleReplied(personId, ctx) {
+async function handleReplied(personId, ctx, attioPerson) {
   const now = new Date().toISOString();
   await attio.setEngagement(personId, {
+    ...commonAttrs(ctx),
     outreachStage: 'Engaged',
+    outboundStatus: 'Replied',
     lastEngagementDate: now,
     lastEngagementType: 'Replied',
     apolloSequenceStatus: 'Paused',
@@ -165,35 +237,48 @@ async function handleOpened(personId, ctx, attioPerson) {
   // and we've hit the threshold.
   const shouldFlag = !alreadyFlagged && newCount >= ENGAGEMENT_OPEN_THRESHOLD;
 
+  // Cumulative lifetime counter, separate from the rolling 7d window.
+  const totalOpens = num(values, 'total_opens') + 1;
+
   await attio.setEngagement(personId, {
+    ...commonAttrs(ctx),
     lastEngagementDate: now.toISOString(),
     lastEngagementType: 'Opened',
     openCount7d: newCount,
     opensResetAt: newResetAt,
+    totalOpens,
+    lastOpened: now.toISOString(),
     ...(shouldFlag && { flaggedForReview: true }),
   });
 
   return {
     stage: 'unchanged',
     openCount: newCount,
+    totalOpens,
     windowStart: newResetAt,
     flagged: shouldFlag,
   };
 }
 
-async function handleClicked(personId, ctx) {
+async function handleClicked(personId, ctx, attioPerson) {
   // Clicks are high-signal. Flag immediately.
   const now = new Date().toISOString();
+  const totalClicks = num(attioPerson?.values, 'total_clicks') + 1;
   await attio.setEngagement(personId, {
+    ...commonAttrs(ctx),
     lastEngagementDate: now,
     lastEngagementType: 'Clicked',
+    totalClicks,
+    lastClicked: now,
     flaggedForReview: true,
   });
-  return { stage: 'unchanged', flagged: true };
+  return { stage: 'unchanged', totalClicks, flagged: true };
 }
 
-async function handleBounced(personId, ctx) {
+async function handleBounced(personId, ctx, attioPerson) {
   await attio.setEngagement(personId, {
+    ...commonAttrs(ctx),
+    outboundStatus: 'Bounced',
     lastEngagementDate: new Date().toISOString(),
     lastEngagementType: 'Bounced',
     apolloSequenceStatus: 'Bounced',
@@ -206,19 +291,24 @@ async function handleBounced(personId, ctx) {
   return { stage: 'Do Not Contact' };
 }
 
-async function handleFinished(personId, ctx) {
+async function handleFinished(personId, ctx, attioPerson) {
   // Sequence completed naturally (all steps sent, no reply). Mark as such
   // but DON'T escalate to human touch — they didn't engage.
+  const sequencesCompleted = num(attioPerson?.values, 'sequences_completed') + 1;
   await attio.setEngagement(personId, {
+    ...commonAttrs(ctx),
     apolloSequenceStatus: 'Finished',
+    sequencesCompleted,
   });
-  return { stage: 'unchanged', sequenceStatus: 'Finished' };
+  return { stage: 'unchanged', sequenceStatus: 'Finished', sequencesCompleted };
 }
 
-async function handleMeeting(personId, ctx) {
+async function handleMeeting(personId, ctx, attioPerson) {
   const now = new Date().toISOString();
   await attio.setEngagement(personId, {
+    ...commonAttrs(ctx),
     outreachStage: 'Meeting Booked',
+    outboundStatus: 'Meeting Booked',
     lastEngagementDate: now,
     lastEngagementType: 'Meeting Booked',
     apolloSequenceStatus: 'Paused',
@@ -228,6 +318,19 @@ async function handleMeeting(personId, ctx) {
     catch (_) {}
   }
   return { stage: 'Meeting Booked' };
+}
+
+/**
+ * An email actually went out. Records that the contact is live in a
+ * sequence; deliberately does NOT touch Outreach Stage, engagement
+ * counters or the flag — a send is our action, not their engagement.
+ */
+async function handleSent(personId, ctx, attioPerson) {
+  await attio.setEngagement(personId, {
+    ...commonAttrs(ctx),
+    apolloSequenceStatus: 'Active',
+  });
+  return { stage: 'unchanged', sequenceStatus: 'Active' };
 }
 
 // --------------------------------------------------------------------

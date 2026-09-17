@@ -1,6 +1,13 @@
 // ====================================================================
 // config.js — bridge configuration
 //
+// SCOPE: StraighterLine / Preppy ONLY. The Attio workspace this bridge
+// writes to is StraighterLine (workspace_slug "straighter-line"). NUKO's
+// Apollo workspace also runs CLIMB and Invigilator outbound; events from
+// those sequences must never reach StraighterLine's Attio. See
+// PREPPY_SEQUENCE_IDS / NON_PREPPY_SEQUENCE_IDS below — the Apollo
+// webhook handler uses them as an allowlist.
+//
 // ARCHITECTURE (final):
 //
 // - Jack runs all cold outbound directly in Apollo (via Flywheel).
@@ -10,7 +17,9 @@
 //   flow into Attio as writeback. The bridge tracks opens on a rolling
 //   7-day window; once a contact hits ENGAGEMENT_OPEN_THRESHOLD opens,
 //   it sets Flagged for Review = true so Rebecca sees them in her
-//   "Needs Human Touch" view. Clicks flag immediately.
+//   "Needs Human Touch" view. Clicks flag immediately. It also keeps
+//   cumulative counters (Total Opens / Total Clicks / Sequences
+//   Completed) and Last Opened / Last Clicked timestamps.
 //
 // - The ONLY Attio-originated Apollo path is the drip re-engagement
 //   list: Rebecca drops a gone-cold lead in the Attio "Drip" list,
@@ -18,26 +27,86 @@
 //   workflow picks it up and enrolls in a drip sequence.
 // ====================================================================
 
-// Apollo list ID for the Bridge Drip re-engagement list.
-// Fill in after creating the Apollo list (see Chrome agent brief).
-const APOLLO_DRIP_LIST_ID = '69d7b41ba031ed000d1125e5';
+// ====================================================================
+// Apollo workspace migration (2026-09-17)
+//
+// NUKO moved to a NEW Apollo workspace; the OLD one deactivates
+// ~2026-10-08. Every ID below is a NEW-workspace ID. The old values are
+// kept in commented blocks purely for traceability.
+// ====================================================================
 
-// Apollo list ID for the "Bridge Inbox" search outbox (existing).
-const APOLLO_INBOX_LIST_ID = '69d65c6b00b0d30015c0eafa';
-
-// Retained for reference — no longer used by the bridge directly. Apollo
-// sequence enrollment is handled by Jack in Apollo's UI.
-const APOLLO_SEQUENCE_IDS_REFERENCE = {
-  'Automated Sequence':                    '69a5f9c5175aaa0011a52b6d',
-  'Preppy – Dept Heads – Referral Engine': '69d40c29e16fa90011eec03a',
-  'Preppy – Education Director – Rural':   '69d408c9160b4a00215cabef',
-  'Preppy – CNO – Rural Staffing':         '69d4052e6344f40019af033c',
-  'High-Touch Sequence':                   '69c6abc9b1641e0011c514d7',
+// --- Sequences (NEW workspace) ------------------------------------
+//
+// Preppy / StraighterLine sequences. These are the live cold sequences
+// whose engagement is allowed to write into StraighterLine's Attio.
+const PREPPY_SEQUENCE_IDS = {
+  'Cold-Preppy - Hospital Allied Health Outreach':                                        '6aa9a7f67c233b0020f82371',
+  'Cold-Preppy/A/-250K Press Release (Control)':                                          '6aa897afed0be8001812ffd6',
+  'Cold-Preppy-/B/-250K Press Release (long form copy)':                                  '6aa897a705907e00102af356',
+  'Cold-Preppy-Sterile Processing Regulatory Trigger (MN)':                               '6aa89799dfc7a700141bd3ce',
+  'Cold-Preppy-Surgical Tech / Sterile Processing — SMU Dallas Independent ASC Speed Play': '6aa8979105907e000c9ee177',
+  'Cold-Preppy-Surgical Tech ASC Owner-Operator Speed Play':                              '6aa89788c6288f000c240be6',
+  'Cold-Preppy-Hot Lead - Fast Follow + Phase-Out':                                       '6aa16e7b9bf68600101e0c0d',
 };
 
-// Rebecca's mailbox and user IDs — retained for reference.
-const APOLLO_DEFAULT_MAILBOX_ID = '6998baa2e1a5e90011234290';
-const APOLLO_REBECCA_USER_ID    = '69a0649787ea9b00217d9cb9';
+// Non-Preppy sequences that also live in the same Apollo workspace.
+// Engagement from these belongs to other clients and MUST NOT be
+// written to StraighterLine's Attio.
+const NON_PREPPY_SEQUENCE_IDS = {
+  'Cold-CLIMB-SPS / Internal OPM Schools':        '6aa58c771fd98c000c8ed0a5',
+  'Cold-CLIMB-Career-Focused Nonprofit Schools':  '6aa58c32a230fa000c4ce3f3',
+  'Cold-CLIMB-Whale-Tier Online Universities':    '6aa58bf71c05af00181872d3',
+  'Cold-Invigilator-Peer-2-Peer Dan\'s Voice':    '6aa16e43bc33ed000c68afe6',
+};
+
+// old→new mapping applied on 2026-09-17 (matched by sequence name):
+//   6a8f52bce2ab1200107d8039 Preppy 250K — Arm A: Short (Control)
+//     → 6aa897afed0be8001812ffd6 Cold-Preppy/A/-250K Press Release (Control)
+//   6a8f52d6e2ab1200107d80cc Preppy 250K — Arm B: Long-Form (Test)
+//     → 6aa897a705907e00102af356 Cold-Preppy-/B/-250K Press Release (long form copy)
+//   6a8dede2a2d53a00108edd66 Sterile Processing — Regulatory Trigger (MN)
+//     → 6aa89799dfc7a700141bd3ce Cold-Preppy-Sterile Processing Regulatory Trigger (MN)
+//   6a8f3eba6e1e69000c11e2ad Surgical Tech / Sterile Processing — SMU Dallas …
+//     → 6aa8979105907e000c9ee177 Cold-Preppy-Surgical Tech / Sterile Processing — SMU Dallas …
+//   6a8dedeb2082410010a6e09a Surgical Tech — ASC Owner-Operator Speed Play
+//     → 6aa89788c6288f000c240be6 Cold-Preppy-Surgical Tech ASC Owner-Operator Speed Play
+//   6a8df24e208241001460f860 Preppy Hot Lead — Fast Follow + Phase-Out
+//     → 6aa16e7b9bf68600101e0c0d Cold-Preppy-Hot Lead - Fast Follow + Phase-Out
+//   (new, no old counterpart) 6aa9a7f67c233b0020f82371 Cold-Preppy - Hospital Allied Health Outreach
+//
+// OLD-workspace sequence IDs, retained for reference only:
+// const APOLLO_SEQUENCE_IDS_REFERENCE_OLD = {
+//   'Automated Sequence':                    '69a5f9c5175aaa0011a52b6d',
+//   'Preppy – Dept Heads – Referral Engine': '69d40c29e16fa90011eec03a',
+//   'Preppy – Education Director – Rural':   '69d408c9160b4a00215cabef',
+//   'Preppy – CNO – Rural Staffing':         '69d4052e6344f40019af033c',
+//   'High-Touch Sequence':                   '69c6abc9b1641e0011c514d7',
+// };
+
+// --- Mailbox / sending user (NEW workspace) -----------------------
+//
+// StraighterLine's sending mailbox is jharney@straighterline.com,
+// owned by Jack (jack.harney@wearenuko.com). Rebecca's old mailbox and
+// user do not exist in the new workspace.
+//
+// OLD: APOLLO_DEFAULT_MAILBOX_ID = '6998baa2e1a5e90011234290' (Rebecca)
+//      APOLLO_REBECCA_USER_ID    = '69a0649787ea9b00217d9cb9'
+const APOLLO_DEFAULT_MAILBOX_ID = '6a79fefce989f70020198d4c'; // jharney@straighterline.com
+const APOLLO_SEND_USER_ID       = '6aa032db66ea780018fb2e20'; // jack.harney@wearenuko.com
+
+// --- Lists / labels (NEW workspace) -------------------------------
+//
+// NOT YET CREATED in the new workspace. The old-workspace IDs below are
+// meaningless there, so they are left null on purpose: the Attio→Apollo
+// drip path fails loudly instead of writing a foreign label id.
+//
+// OLD: APOLLO_DRIP_LIST_ID  = '69d7b41ba031ed000d1125e5' (Bridge Drip)
+//      APOLLO_INBOX_LIST_ID = '69d65c6b00b0d30015c0eafa' (Bridge Inbox)
+const APOLLO_DRIP_LIST_ID  = null;
+const APOLLO_INBOX_LIST_ID = null;
+
+// No Apollo custom-field IDs are used by the bridge — it writes no
+// typed_custom_fields. Nothing to remap there.
 
 // ====================================================================
 // Engagement threshold settings
@@ -66,15 +135,23 @@ const ENABLE_REDUNDANT_APOLLO_REMOVAL = false;
 // Dead-man's-switch auto-heal: same gating issue. Alert only.
 const DEAD_MANS_SWITCH_AUTO_HEAL = false;
 
+// When an Apollo event names a sequence id that is in neither
+// PREPPY_SEQUENCE_IDS nor NON_PREPPY_SEQUENCE_IDS, the handler skips the
+// Attio write and alerts. Set false only if a new Preppy sequence needs
+// to flow before its id is added above.
+const REQUIRE_KNOWN_PREPPY_SEQUENCE = true;
+
 module.exports = {
+  PREPPY_SEQUENCE_IDS,
+  NON_PREPPY_SEQUENCE_IDS,
   APOLLO_DRIP_LIST_ID,
   APOLLO_INBOX_LIST_ID,
-  APOLLO_SEQUENCE_IDS_REFERENCE,
   APOLLO_DEFAULT_MAILBOX_ID,
-  APOLLO_REBECCA_USER_ID,
+  APOLLO_SEND_USER_ID,
   ENGAGEMENT_OPEN_THRESHOLD,
   ENGAGEMENT_OPEN_WINDOW_DAYS,
   OPEN_EVENT_DEDUPE_WINDOW_MINUTES,
   ENABLE_REDUNDANT_APOLLO_REMOVAL,
   DEAD_MANS_SWITCH_AUTO_HEAL,
+  REQUIRE_KNOWN_PREPPY_SEQUENCE,
 };

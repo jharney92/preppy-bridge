@@ -80,7 +80,7 @@ preppy-bridge/
 ## Pre-deploy checklist
 
 **1. Fill in `config.js`:**
-Only one value needs to change from what's already there: `APOLLO_DRIP_LIST_ID`. The Chrome agent brief walks you through creating the Apollo list and grabbing the ID.
+`APOLLO_DRIP_LIST_ID` and `APOLLO_INBOX_LIST_ID` are `null` — the "Bridge Drip" and "Bridge Inbox" lists have not been recreated in the new Apollo workspace. Until they are, the Attio→Apollo drip path throws instead of running.
 
 **2. Schema update in Attio:**
 Before deploying, add two new attributes to the People object. The Chrome agent brief covers this.
@@ -96,7 +96,7 @@ Without these attributes, the open-threshold logic will silently no-op because t
 - `ATTIO_API_KEY`
 - `APOLLO_API_KEY` (use the `preppy_flywheel` key, NOT Attio Connect)
 - `WEBHOOK_SHARED_SECRET`
-- `SLACK_ALERT_WEBHOOK_URL` (optional)
+- `SLACK_ALERT_WEBHOOK_URL` (optional — when unset, alerts still print to `vercel logs` at error level, including an explicit "nobody was paged" line)
 
 ## Engagement threshold logic
 
@@ -118,14 +118,35 @@ const OPEN_EVENT_DEDUPE_WINDOW_MINUTES = 60; // rapid-fire noise filter
 
 ### Apollo → Attio (writeback)
 
+Every event also writes `Apollo Contact ID` and `Assigned Sequence`.
+
 | Event | Effect in Attio |
 |---|---|
-| `replied` | `Outreach Stage = Engaged`, note created with reply body |
-| `opened` | `Last Engagement Date` + counter increment, flag if threshold hit |
-| `clicked` | `Last Engagement Type = Clicked`, `Flagged for Review = true` |
-| `bounced` | `Outreach Stage = Do Not Contact` |
-| `finished` | `Apollo Sequence Status = Finished` (no stage change) |
-| `meeting` | `Outreach Stage = Meeting Booked` |
+| `sent` | `Apollo Sequence Status = Active` (no engagement fields touched) |
+| `opened` | `Total Opens` +1, `Last Opened`, `Last Engagement Date/Type`, 7d counter increment, flag if threshold hit |
+| `clicked` | `Total Clicks` +1, `Last Clicked`, `Last Engagement Type = Clicked`, `Flagged for Review = true` |
+| `replied` | `Outreach Stage = Engaged`, `Outbound Status = Replied`, `Apollo Sequence Status = Paused`, note created with reply body |
+| `bounced` | `Outreach Stage = Do Not Contact`, `Outbound Status = Bounced`, `Apollo Sequence Status = Bounced` |
+| `finished` | `Apollo Sequence Status = Finished`, `Sequences Completed` +1 (no stage change) |
+| `meeting` | `Outreach Stage = Meeting Booked`, `Outbound Status = Meeting Booked` |
+
+### StraighterLine-only scope guard
+
+NUKO's Apollo workspace also runs CLIMB and Invigilator outbound. This
+bridge writes **only** into StraighterLine's Attio (`straighter-line`), so
+`api/apollo-webhook.js` checks the payload's sequence id against
+`config.PREPPY_SEQUENCE_IDS` **before** any Attio call:
+
+- known Preppy sequence → processed
+- known non-Preppy sequence (CLIMB / Invigilator) → dropped, logged
+- unknown sequence id → dropped **and alerted** (add it to config if it is a new Preppy sequence)
+- no sequence id in the payload → processed; the per-sequence Apollo workflow URL is the scope
+
+### Security
+
+`WEBHOOK_SHARED_SECRET` fails **closed**: if the env var is unset the
+endpoint rejects every request with 401 rather than running unauthenticated.
+Secrets are compared in constant time.
 
 ### Attio → Apollo
 
