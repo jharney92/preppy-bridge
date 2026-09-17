@@ -50,7 +50,7 @@
 const { ok, bad, fail, verifySecret } = require('../lib/respond');
 const attio = require('../lib/attio');
 const apollo = require('../lib/apollo');
-const { shouldWriteOpenEvent } = require('../lib/dedupe');
+const { shouldWriteOpenEvent, isDuplicateOpen, isDuplicateClick } = require('../lib/dedupe');
 const { alert } = require('../lib/notify');
 const {
   ENABLE_REDUNDANT_APOLLO_REMOVAL,
@@ -326,14 +326,27 @@ async function handleReplied(personId, ctx, attioPerson) {
 
 async function handleOpened(personId, ctx, attioPerson) {
   // Rapid-fire dedupe — Apollo often fires multiple open events from
-  // image preloaders in quick succession. The dedupe window (default 60
-  // min) collapses these so one real visit = one count increment.
-  if (ctx.apolloContactId && !shouldWriteOpenEvent(ctx.apolloContactId)) {
+  // image preloaders in quick succession, and a cold start or a second
+  // concurrent Lambda can replay one that was already counted. The
+  // in-process Map is only a fast path; the record's own `last_opened`
+  // below is what makes the dedupe survive a cold start.
+  if (ctx.apolloContactId && !shouldWriteOpenEvent(ctx.apolloContactId, 'opened')) {
     return { skipped: 'deduped' };
   }
 
   // Read current counter state from the Attio record.
   const values = attioPerson?.values || {};
+
+  // Durable dedupe: this record's last counted open. Inside the 60-minute
+  // window (config.OPEN_EVENT_DEDUPE_WINDOW_MINUTES) the event is treated
+  // as a replay and nothing is written — deliberately conservative, since
+  // an inflated open count produces a false "Flagged for Review" while a
+  // missed one only delays the flag to the contact's next open.
+  const lastOpenedAt = values.last_opened?.[0]?.value || null;
+  if (isDuplicateOpen(lastOpenedAt)) {
+    console.log(`[apollo-webhook:opened] deduped against last_opened=${lastOpenedAt} person=${personId}`);
+    return { skipped: 'deduped_durable', lastOpened: lastOpenedAt };
+  }
   const currentCount = Number(values.open_count_7d?.[0]?.value) || 0;
   const resetAt = values.opens_reset_at?.[0]?.value
     ? new Date(values.opens_reset_at[0].value)
@@ -384,6 +397,21 @@ async function handleOpened(personId, ctx, attioPerson) {
 
 async function handleClicked(personId, ctx, attioPerson) {
   // Clicks are high-signal. Flag immediately.
+  const values = attioPerson?.values || {};
+
+  // Same durable dedupe as opens, against `last_clicked` and the
+  // 60-minute CLICK_EVENT_DEDUPE_WINDOW_MINUTES. The first click of the
+  // window already set flagged_for_review, so skipping a replay costs
+  // nothing but a counter increment that never happened.
+  if (ctx.apolloContactId && !shouldWriteOpenEvent(ctx.apolloContactId, 'clicked')) {
+    return { skipped: 'deduped' };
+  }
+  const lastClickedAt = values.last_clicked?.[0]?.value || null;
+  if (isDuplicateClick(lastClickedAt)) {
+    console.log(`[apollo-webhook:clicked] deduped against last_clicked=${lastClickedAt} person=${personId}`);
+    return { skipped: 'deduped_durable', lastClicked: lastClickedAt };
+  }
+
   const now = new Date().toISOString();
   const totalClicks = num(attioPerson?.values, 'total_clicks') + 1;
   await attio.setEngagement(personId, {

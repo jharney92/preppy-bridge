@@ -130,9 +130,16 @@ const ENGAGEMENT_OPEN_THRESHOLD = 3;
 const ENGAGEMENT_OPEN_WINDOW_DAYS = 7;
 
 // Noise dedupe: the SAME open event may fire multiple times from image
-// preloaders. This window prevents rapid-fire duplicates from being
-// double-counted. Set shorter than a normal user revisit gap.
+// preloaders, and a serverless cold start or a second concurrent Lambda
+// can replay one that a previous invocation already counted. Within this
+// window a contact's repeat open is not counted again. The check is made
+// against the Attio record's own `last_opened`, so it holds across
+// processes — see lib/dedupe.js.
 const OPEN_EVENT_DEDUPE_WINDOW_MINUTES = 60;
+
+// Same rule for clicks, compared against `last_clicked`. Clicks are rarer
+// than opens, but a link with a tracking redirect can still fire twice.
+const CLICK_EVENT_DEDUPE_WINDOW_MINUTES = 60;
 
 // ====================================================================
 // Behavior knobs
@@ -155,6 +162,7 @@ module.exports = {
   ENGAGEMENT_OPEN_THRESHOLD,
   ENGAGEMENT_OPEN_WINDOW_DAYS,
   OPEN_EVENT_DEDUPE_WINDOW_MINUTES,
+  CLICK_EVENT_DEDUPE_WINDOW_MINUTES,
   ENABLE_REDUNDANT_APOLLO_REMOVAL,
   DEAD_MANS_SWITCH_AUTO_HEAL,
 };
