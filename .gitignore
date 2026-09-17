@@ -2,3 +2,8 @@
 .env*.local
 .vercel
 node_modules
+
+# Backfill run artifacts — contain contact PII, regenerate by re-running the script
+backfill_plan.json
+backfill_created.json
+backfill_rollback_log.json
