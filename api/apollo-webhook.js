@@ -18,6 +18,15 @@
 // against config.PREPPY_SEQUENCE_IDS before any Attio call. The check
 // fails CLOSED — see sequenceGate() below.
 //
+// MISSING PEOPLE: the bridge can only write engagement onto an Attio
+// record, and nothing has been creating StraighterLine People since
+// 2026-08-06, so most events landed on no record at all. A gated contact
+// with no Attio person is now created via a dedupe-safe upsert (assert on
+// email_addresses) stamped source_batch_id = "bridge_autocreate", and the
+// event's normal field writes then apply on top. The sequence allowlist
+// still runs FIRST and still fails closed: a contact outside a Preppy
+// sequence can never cause a create.
+//
 // Engagement threshold logic:
 // - Clicks flag immediately (Flagged for Review = true).
 // - Opens are counted on a rolling N-day window; once the count reaches
@@ -53,6 +62,11 @@ const {
 const VALID_EVENTS = new Set(['replied', 'opened', 'clicked', 'bounced', 'finished', 'meeting', 'sent']);
 
 const PREPPY_IDS     = new Set(Object.values(PREPPY_SEQUENCE_IDS));
+
+// Stamped on People the webhook creates itself, so autocreated records
+// stay distinguishable from the manual import and from Cortex's pushes.
+// Queryable: filter People on source_batch_id.
+const AUTOCREATE_BATCH_ID = 'bridge_autocreate';
 
 // Maps an Apollo sequence id to a name for the Attio "Assigned Sequence"
 // text field.
@@ -100,7 +114,12 @@ async function sequenceGate(ctx) {
 
   const matched = lookup.sequenceIds.filter(id => PREPPY_IDS.has(id));
   if (matched.length > 0) {
-    return { allow: true, reason: 'preppy_sequence', sequenceIds: matched };
+    return {
+      allow: true,
+      reason: 'preppy_sequence',
+      sequenceIds: matched,
+      apolloContact: lookup.contact || null,
+    };
   }
 
   // Resolved, but not ours. Expected traffic now that other clients share
@@ -191,26 +210,67 @@ async function dispatch(event, body) {
   // The gate resolved the real sequence membership; trust it over the payload.
   ctx.sequenceId = gate.sequenceIds[0];
 
+  // Apollo is authoritative for the contact's own details; the webhook
+  // body is often thinner than the record the gate just resolved.
+  const apolloContact = gate.apolloContact || {};
+  if (!ctx.email && apolloContact.email) ctx.email = String(apolloContact.email).toLowerCase();
+  if (!ctx.apolloContactId && apolloContact.id) ctx.apolloContactId = apolloContact.id;
+
   // Find the Attio person record. Prefer email lookup since Apollo Contact ID
   // is stored there but not always indexed.
-  const attioPerson = ctx.email
+  let attioPerson = ctx.email
     ? await attio.findPersonByEmail(ctx.email)
     : null;
-  if (!attioPerson) {
-    console.warn(`[apollo-webhook:${event}] no Attio person for email ${ctx.email}`);
-    return { skipped: 'no_attio_person', email: ctx.email };
-  }
-  const attioPersonId = attioPerson?.id?.record_id;
+  let attioPersonId = attioPerson?.id?.record_id;
+  let created = false;
 
-  switch (event) {
-    case 'replied':   return handleReplied(attioPersonId, ctx, attioPerson);
-    case 'opened':    return handleOpened(attioPersonId, ctx, attioPerson);
-    case 'clicked':   return handleClicked(attioPersonId, ctx, attioPerson);
-    case 'bounced':   return handleBounced(attioPersonId, ctx, attioPerson);
-    case 'finished':  return handleFinished(attioPersonId, ctx, attioPerson);
-    case 'meeting':   return handleMeeting(attioPersonId, ctx, attioPerson);
-    case 'sent':      return handleSent(attioPersonId, ctx, attioPerson);
+  if (!attioPerson) {
+    // The contact is in a Preppy sequence (the gate above already proved
+    // that and fails closed) but has no Attio record — historically these
+    // events were dropped, which lost 77% of StraighterLine engagement.
+    // Create the person, then let the normal event handlers write on top.
+    if (!ctx.email) {
+      // No email means no dedupe key, so a create would risk a duplicate
+      // or a junk record. Skip rather than guess.
+      console.warn(`[apollo-webhook:${event}] gated contact has no email — no record created`, ctx.apolloContactId);
+      return { skipped: 'no_email_cannot_create', apolloContactId: ctx.apolloContactId };
+    }
+
+    // `company` in this workspace is a record-reference to Companies, so
+    // the Apollo organisation NAME cannot be written to it. Left unset on
+    // purpose — a wrong-typed write would be rejected or, worse, point at
+    // the wrong company.
+    const upserted = await attio.upsertPersonByEmail({
+      email: ctx.email,
+      firstName: ctx.firstName || apolloContact.first_name,
+      lastName: ctx.lastName || apolloContact.last_name,
+      fullName: apolloContact.name,
+      jobTitle: ctx.title || apolloContact.title,
+      apolloContactId: ctx.apolloContactId,
+      assignedSequence: SEQUENCE_NAME_BY_ID[ctx.sequenceId],
+      sourceBatchId: AUTOCREATE_BATCH_ID,
+    });
+
+    attioPersonId = upserted.recordId;
+    // Re-read so the engagement handlers see real counter state. An assert
+    // can match an existing record the email query missed; reading back is
+    // what keeps counters from being clobbered back to 1.
+    attioPerson = await attio.getPersonById(attioPersonId) || { id: { record_id: attioPersonId }, values: {} };
+    created = true;
+    console.log(`[apollo-webhook:${event}] created Attio person ${attioPersonId} for ${ctx.email}`);
   }
+
+  let handled;
+  switch (event) {
+    case 'replied':   handled = await handleReplied(attioPersonId, ctx, attioPerson); break;
+    case 'opened':    handled = await handleOpened(attioPersonId, ctx, attioPerson); break;
+    case 'clicked':   handled = await handleClicked(attioPersonId, ctx, attioPerson); break;
+    case 'bounced':   handled = await handleBounced(attioPersonId, ctx, attioPerson); break;
+    case 'finished':  handled = await handleFinished(attioPersonId, ctx, attioPerson); break;
+    case 'meeting':   handled = await handleMeeting(attioPersonId, ctx, attioPerson); break;
+    case 'sent':      handled = await handleSent(attioPersonId, ctx, attioPerson); break;
+  }
+  return { ...handled, attioPersonId, personCreated: created };
 }
 
 /**
