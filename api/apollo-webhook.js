@@ -12,9 +12,11 @@
 //   7. "Preppy Flywheel: Email Sent → Webhook"         (event=sent)
 //
 // SCOPE GUARD: NUKO's Apollo workspace also runs CLIMB and Invigilator
-// outbound. This endpoint writes ONLY into StraighterLine's Attio, so any
-// event carrying a sequence id that is not a known Preppy sequence is
-// dropped before the Attio lookup (see config.PREPPY_SEQUENCE_IDS).
+// outbound, and the workflow webhook body carries no sequence id. This
+// endpoint writes ONLY into StraighterLine's Attio, so every request is
+// resolved against Apollo and its real sequence membership checked
+// against config.PREPPY_SEQUENCE_IDS before any Attio call. The check
+// fails CLOSED — see sequenceGate() below.
 //
 // Engagement threshold logic:
 // - Clicks flag immediately (Flagged for Review = true).
@@ -25,8 +27,15 @@
 // - Flagged contacts are NOT pulled out of their cold sequence; Apollo's
 //   native auto-remove-on-reply handles the most important cutoff.
 //
-// Routing strategy: prefer ?event= hint in the webhook URL, fall back to
-// sniffing the payload shape.
+// Routing: the ?event= query param is required — the Apollo body carries
+// no event name. An unrecognised event is a 400.
+//
+// Request contract (do not change without updating the Apollo workflows):
+//   POST https://preppy-bridge.vercel.app/api/apollo-webhook
+//        ?event=opened|clicked|replied|bounced|finished|meeting
+//        &secret=<WEBHOOK_SHARED_SECRET>
+//   body: {email, first_name, last_name, title, company, contact_id}
+//         — or empty, which the handler tolerates.
 // ====================================================================
 
 const { ok, bad, fail, verifySecret } = require('../lib/respond');
@@ -39,14 +48,11 @@ const {
   ENGAGEMENT_OPEN_THRESHOLD,
   ENGAGEMENT_OPEN_WINDOW_DAYS,
   PREPPY_SEQUENCE_IDS,
-  NON_PREPPY_SEQUENCE_IDS,
-  REQUIRE_KNOWN_PREPPY_SEQUENCE,
 } = require('../config');
 
 const VALID_EVENTS = new Set(['replied', 'opened', 'clicked', 'bounced', 'finished', 'meeting', 'sent']);
 
 const PREPPY_IDS     = new Set(Object.values(PREPPY_SEQUENCE_IDS));
-const NON_PREPPY_IDS = new Set(Object.values(NON_PREPPY_SEQUENCE_IDS));
 
 // Maps an Apollo sequence id to a name for the Attio "Assigned Sequence"
 // text field.
@@ -55,25 +61,56 @@ const SEQUENCE_NAME_BY_ID = Object.fromEntries(
 );
 
 /**
- * Decide whether an event belongs to StraighterLine.
+ * Decide whether an event belongs to StraighterLine — the hard scope rule.
  *
- * - No sequence id in the payload: allow. The Apollo workflow that calls
- *   this URL is itself scoped to a Preppy sequence, so the URL is the
- *   scope. Logged so an unexpected source is still visible.
- * - Known Preppy id: allow.
- * - Known non-Preppy id (CLIMB, Invigilator): drop, quietly — this is
- *   expected traffic if a workflow is ever mis-pointed.
- * - Unknown id: drop and alert. A new Preppy sequence needs adding to
- *   config.PREPPY_SEQUENCE_IDS; anything else is another client's data.
+ * Apollo's workflow webhook body carries NO sequence id (it is
+ * {email, first_name, last_name, title, company, contact_id}, with the
+ * event name in the query string), and the workflows' only enrolment
+ * filter is prospected_by_current_team. The new Apollo workspace also
+ * holds CLIMB and Invigilator sequences, so membership must be read back
+ * from Apollo before anything is written to StraighterLine's Attio.
+ *
+ * FAILS CLOSED. Anything other than "this contact is demonstrably in a
+ * Preppy sequence" results in no Attio write:
+ *   - contact not resolvable in Apollo        -> skip
+ *   - contact in zero sequences               -> skip
+ *   - contact only in non-Preppy sequences    -> skip
+ *   - Apollo lookup errors                    -> skip + alert
  */
-function sequenceGate(sequenceId) {
-  if (!sequenceId) return { allow: true, reason: 'no_sequence_id_in_payload' };
-  if (PREPPY_IDS.has(sequenceId)) return { allow: true, reason: 'preppy' };
-  if (NON_PREPPY_IDS.has(sequenceId)) {
-    return { allow: false, reason: 'non_preppy_sequence', alert: false };
+async function sequenceGate(ctx) {
+  let lookup;
+  try {
+    lookup = await apollo.getContactSequenceIds({
+      contactId: ctx.apolloContactId,
+      email: ctx.email,
+    });
+  } catch (err) {
+    // Fail closed: an Apollo outage must not become an unscoped Attio write.
+    return {
+      allow: false,
+      reason: 'apollo_lookup_failed',
+      alert: true,
+      detail: { error: err.message },
+    };
   }
-  if (!REQUIRE_KNOWN_PREPPY_SEQUENCE) return { allow: true, reason: 'unknown_sequence_allowed_by_config' };
-  return { allow: false, reason: 'unknown_sequence', alert: true };
+
+  if (!lookup.found) {
+    return { allow: false, reason: 'contact_not_found_in_apollo', alert: true };
+  }
+
+  const matched = lookup.sequenceIds.filter(id => PREPPY_IDS.has(id));
+  if (matched.length > 0) {
+    return { allow: true, reason: 'preppy_sequence', sequenceIds: matched };
+  }
+
+  // Resolved, but not ours. Expected traffic now that other clients share
+  // the workspace — logged, not alerted.
+  return {
+    allow: false,
+    reason: 'contact not in a StraighterLine sequence',
+    alert: false,
+    detail: { sequenceIds: lookup.sequenceIds },
+  };
 }
 
 // Read a number attribute off an Attio record, defaulting to 0.
@@ -87,16 +124,26 @@ module.exports = async (req, res) => {
   if (req.method !== 'POST') return bad(res, 'method not allowed', 405);
   if (!verifySecret(req)) return bad(res, 'unauthorized', 401);
 
+  // An empty body is a real case, not an error: the Meeting Booked
+  // workflow has historically POSTed nothing at all. Normalise to {} and
+  // let the extractor decide — a body with no contact is skipped below
+  // with a 200 so Apollo doesn't retry it forever.
   let body = req.body;
   if (typeof body === 'string') {
-    try { body = JSON.parse(body); } catch (_) { return bad(res, 'invalid json'); }
+    const trimmed = body.trim();
+    if (!trimmed) {
+      body = {};
+    } else {
+      try { body = JSON.parse(trimmed); } catch (_) { return bad(res, 'invalid json'); }
+    }
   }
-  if (!body) return bad(res, 'empty body');
+  if (body === null || body === undefined) body = {};
+  if (typeof body !== 'object' || Array.isArray(body)) return bad(res, 'body must be a JSON object');
 
   const event = (req.query?.event || '').toLowerCase();
   if (!VALID_EVENTS.has(event)) {
     await alert('Apollo webhook missing/invalid ?event= hint', { event, sample: body });
-    return bad(res, `must specify ?event=replied|opened|clicked|bounced|finished|meeting`);
+    return bad(res, 'must specify ?event=opened|clicked|replied|bounced|finished|meeting');
   }
 
   try {
@@ -114,20 +161,35 @@ module.exports = async (req, res) => {
 async function dispatch(event, body) {
   const ctx = extractContext(body);
   if (!ctx.email && !ctx.apolloContactId) {
-    throw new Error('apollo webhook payload missing both email and contact_id');
+    // Nothing to identify the contact by — most likely the Meeting Booked
+    // workflow's empty body. Loud in the logs, but a 200 so Apollo stops
+    // retrying; there is no work this request can do.
+    await alert('Apollo webhook carried no contact_id and no email — nothing written to Attio', {
+      event,
+      bodyKeys: Object.keys(body || {}),
+    });
+    return { skipped: 'no_contact_identifier_in_payload' };
   }
 
   // StraighterLine-only guard — runs BEFORE any Attio call.
-  const gate = sequenceGate(ctx.sequenceId);
+  const gate = await sequenceGate(ctx);
+  const gateDetail = {
+    event,
+    contactId: ctx.apolloContactId,
+    email: ctx.email,
+    reason: gate.reason,
+    ...(gate.detail || {}),
+  };
   if (!gate.allow) {
-    const detail = { event, sequenceId: ctx.sequenceId, reason: gate.reason };
     if (gate.alert) {
-      await alert('Apollo webhook from an unrecognised sequence — dropped, nothing written to Attio', detail);
+      await alert('Apollo webhook dropped — could not confirm a StraighterLine sequence; nothing written to Attio', gateDetail);
     } else {
-      console.warn('[apollo-webhook] dropped non-Preppy sequence event', JSON.stringify(detail));
+      console.warn(`[apollo-webhook:${event}] skipped: ${gate.reason}`, JSON.stringify(gateDetail));
     }
-    return { skipped: gate.reason, sequenceId: ctx.sequenceId };
+    return { skipped: gate.reason, sequenceIds: gate.detail?.sequenceIds };
   }
+  // The gate resolved the real sequence membership; trust it over the payload.
+  ctx.sequenceId = gate.sequenceIds[0];
 
   // Find the Attio person record. Prefer email lookup since Apollo Contact ID
   // is stored there but not always indexed.

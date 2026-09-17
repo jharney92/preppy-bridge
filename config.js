@@ -5,8 +5,16 @@
 // writes to is StraighterLine (workspace_slug "straighter-line"). NUKO's
 // Apollo workspace also runs CLIMB and Invigilator outbound; events from
 // those sequences must never reach StraighterLine's Attio. See
-// PREPPY_SEQUENCE_IDS / NON_PREPPY_SEQUENCE_IDS below — the Apollo
-// webhook handler uses them as an allowlist.
+// PREPPY_SEQUENCE_IDS below — the Apollo webhook handler uses it as a
+// strict, fail-closed allowlist.
+//
+// The Apollo workflow webhook body carries NO sequence id (it is
+// {email, first_name, last_name, title, company, contact_id}), and the
+// workflows' only enrolment filter is prospected_by_current_team. So the
+// handler resolves each contact against Apollo and checks its actual
+// sequence membership against PREPPY_SEQUENCE_IDS before writing. To let
+// a new Preppy sequence through, add its id here — that is the only
+// change required.
 //
 // ARCHITECTURE (final):
 //
@@ -50,8 +58,10 @@ const PREPPY_SEQUENCE_IDS = {
 };
 
 // Non-Preppy sequences that also live in the same Apollo workspace.
-// Engagement from these belongs to other clients and MUST NOT be
-// written to StraighterLine's Attio.
+// REFERENCE ONLY — the gate is a strict allowlist, so anything absent
+// from PREPPY_SEQUENCE_IDS is already blocked. This list exists so a
+// skipped id can be recognised at a glance in the logs. Engagement from
+// these belongs to other clients and MUST NOT reach StraighterLine.
 const NON_PREPPY_SEQUENCE_IDS = {
   'Cold-CLIMB-SPS / Internal OPM Schools':        '6aa58c771fd98c000c8ed0a5',
   'Cold-CLIMB-Career-Focused Nonprofit Schools':  '6aa58c32a230fa000c4ce3f3',
@@ -135,12 +145,6 @@ const ENABLE_REDUNDANT_APOLLO_REMOVAL = false;
 // Dead-man's-switch auto-heal: same gating issue. Alert only.
 const DEAD_MANS_SWITCH_AUTO_HEAL = false;
 
-// When an Apollo event names a sequence id that is in neither
-// PREPPY_SEQUENCE_IDS nor NON_PREPPY_SEQUENCE_IDS, the handler skips the
-// Attio write and alerts. Set false only if a new Preppy sequence needs
-// to flow before its id is added above.
-const REQUIRE_KNOWN_PREPPY_SEQUENCE = true;
-
 module.exports = {
   PREPPY_SEQUENCE_IDS,
   NON_PREPPY_SEQUENCE_IDS,
@@ -153,5 +157,4 @@ module.exports = {
   OPEN_EVENT_DEDUPE_WINDOW_MINUTES,
   ENABLE_REDUNDANT_APOLLO_REMOVAL,
   DEAD_MANS_SWITCH_AUTO_HEAL,
-  REQUIRE_KNOWN_PREPPY_SEQUENCE,
 };

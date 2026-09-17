@@ -132,15 +132,32 @@ Every event also writes `Apollo Contact ID` and `Assigned Sequence`.
 
 ### StraighterLine-only scope guard
 
-NUKO's Apollo workspace also runs CLIMB and Invigilator outbound. This
-bridge writes **only** into StraighterLine's Attio (`straighter-line`), so
-`api/apollo-webhook.js` checks the payload's sequence id against
-`config.PREPPY_SEQUENCE_IDS` **before** any Attio call:
+NUKO's Apollo workspace also runs CLIMB and Invigilator outbound, and the
+Apollo workflows' only enrolment filter is `prospected_by_current_team` —
+they will happily deliver other clients' engagement to this endpoint. The
+webhook body carries **no sequence id**, so the URL cannot be trusted as
+scope either.
 
-- known Preppy sequence → processed
-- known non-Preppy sequence (CLIMB / Invigilator) → dropped, logged
-- unknown sequence id → dropped **and alerted** (add it to config if it is a new Preppy sequence)
-- no sequence id in the payload → processed; the per-sequence Apollo workflow URL is the scope
+Therefore `api/apollo-webhook.js` resolves every request against Apollo
+(`contact_id`, falling back to `email`) and checks the contact's real
+`emailer_campaign_ids` against `config.PREPPY_SEQUENCE_IDS` **before any
+Attio call**. It **fails closed**:
+
+| Outcome | Result |
+|---|---|
+| Contact is in a Preppy sequence | processed |
+| Contact is only in non-Preppy sequences | skipped, logged `skipped: contact not in a StraighterLine sequence` |
+| Contact is in zero sequences | skipped, same line |
+| Contact not resolvable in Apollo | skipped **and alerted** |
+| Apollo lookup errors | skipped **and alerted** |
+
+All skips return HTTP 200 so Apollo does not retry. To admit a new Preppy
+sequence, add its id to `PREPPY_SEQUENCE_IDS` — that is the only change
+needed.
+
+An **empty request body** is tolerated (the Meeting Booked workflow has
+historically sent one): it is logged, alerted, and skipped with a 200
+rather than throwing.
 
 ### Security
 
@@ -163,8 +180,13 @@ Secrets are compared in constant time.
 Existing URLs from v1 stay the same. One new Apollo webhook needs to be added:
 
 ```
-https://preppy-bridge.vercel.app/api/apollo-webhook?event=clicked&secret=<SECRET>
+POST https://preppy-bridge.vercel.app/api/apollo-webhook?event=<event>&secret=<SECRET>
 ```
+
+`<event>` is one of `opened` `clicked` `replied` `bounced` `finished`
+`meeting` (`sent` is also accepted). `<SECRET>` is the 64-char
+`WEBHOOK_SHARED_SECRET` env var on the Vercel project. Auth is the query
+secret only — Apollo workflows send no custom headers on these.
 
 ## Known gating
 
